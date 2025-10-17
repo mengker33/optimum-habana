@@ -15,6 +15,7 @@
 from typing import Any, Dict, Optional, Union
 
 import torch
+import torch.nn.functional as F
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
 # from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
@@ -24,6 +25,8 @@ from diffusers.utils import (
     scale_lora_layers,
     unscale_lora_layers,
 )
+
+from ...distributed import parallel_state
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -65,6 +68,40 @@ def WanTransformer3DModleForwardGaudi(
 
     hidden_states = self.patch_embedding(hidden_states)
     hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+    pad_len = 0
+    if parallel_state.sequence_parallel_is_initialized():
+        seq_len = hidden_states.shape[1]
+        cp_size = parallel_state.get_sequence_parallel_world_size()
+        # We need to ensure seq_len can be divided by cp_size
+        if seq_len % cp_size != 0:
+            padded_seq_len = (seq_len // cp_size + 1) * cp_size
+            pad_len = padded_seq_len - seq_len
+            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len))
+            cos = F.pad(rotary_emb[0], (0, 0, 0, 0, 0, pad_len))
+            sin = F.pad(rotary_emb[1], (0, 0, 0, 0, 0, pad_len))
+            rotary_emb = (cos, sin)
+            if timestep.ndim == 2:
+                timestep = F.pad(timestep, (0, pad_len))
+
+            seq_len = padded_seq_len
+
+        sp_seq_len = seq_len // parallel_state.get_sequence_parallel_world_size()
+        start = sp_seq_len * parallel_state.get_sequence_parallel_rank()
+        end = sp_seq_len * (parallel_state.get_sequence_parallel_rank() + 1)
+
+        hidden_states = hidden_states[:, start:end, :]
+
+        # timestep with 2 dims means expand_timesteps in config is True, and
+        # We only need to split the timestep when it has 2 dim.
+        expanded_timestep = False
+        if timestep.ndim == 2:
+            expanded_timestep = True
+            timestep = timestep[:, start:end]
+
+        cos = rotary_emb[0][:, start:end, :, :]
+        sin = rotary_emb[1][:, start:end, :, :]
+        rotary_emb = (cos, sin)
 
     # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
     if timestep.ndim == 2:
@@ -117,9 +154,47 @@ def WanTransformer3DModleForwardGaudi(
     shift = shift.to(hidden_states.device)
     scale = scale.to(hidden_states.device)
 
+    if parallel_state.sequence_parallel_is_initialized():
+        cp_size = parallel_state.get_sequence_parallel_world_size()
+        bs, seq, dim = hidden_states.shape
+
+        gather_hidden = torch.empty(bs, seq * cp_size, dim, dtype=hidden_states.dtype, device=hidden_states.device)
+        gather1 = torch.distributed.all_gather_into_tensor(
+            gather_hidden,
+            hidden_states,
+            group=parallel_state.get_sequence_parallel_group(),
+            async_op=True,
+        )
+
+        gather_shift = None
+        gather_scale = None
+        if expanded_timestep:
+            gather_shift = torch.empty(bs, seq * cp_size, dim, dtype=shift.dtype, device=shift.device)
+            torch.distributed.all_gather_into_tensor(
+                gather_shift,
+                shift,
+                group=parallel_state.get_sequence_parallel_group(),
+                async_op=False,
+            )
+
+            gather_scale = torch.empty(bs, seq * cp_size, dim, dtype=scale.dtype, device=scale.device)
+            torch.distributed.all_gather_into_tensor(
+                gather_scale,
+                scale,
+                group=parallel_state.get_sequence_parallel_group(),
+                async_op=False,
+            )
+
+        gather1.wait()
+
+        hidden_states = gather_hidden.reshape(bs, seq * cp_size, dim)
+        shift = gather_shift if gather_shift is not None else shift
+        scale = gather_scale if gather_scale is not None else scale
+
     hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
     hidden_states = self.proj_out(hidden_states)
 
+    hidden_states = hidden_states[:, :-pad_len, :] if pad_len > 0 else hidden_states
     hidden_states = hidden_states.reshape(
         batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
     )
