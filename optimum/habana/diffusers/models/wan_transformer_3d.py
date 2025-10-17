@@ -25,6 +25,8 @@ from diffusers.utils import (
     unscale_lora_layers,
 )
 
+from ...distributed import parallel_state
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -65,6 +67,25 @@ def WanTransformer3DModleForwardGaudi(
 
     hidden_states = self.patch_embedding(hidden_states)
     hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+    if parallel_state.sequence_parallel_is_initialized():
+        seq_len = hidden_states.shape[1]
+        sp_seq_len = seq_len // parallel_state.get_sequence_parallel_world_size()
+        start = sp_seq_len * parallel_state.get_sequence_parallel_rank()
+        end = sp_seq_len * (parallel_state.get_sequence_parallel_rank() + 1)
+
+        hidden_states = hidden_states[:, start:end, :]
+
+        # timestep with 2 dims means expand_timesteps in config is True, and
+        # We only need to split the timestep when it has 2 dim.
+        expanded_timestep = False
+        if timestep.ndim == 2:
+            expanded_timestep = True
+            timestep = timestep[:, start:end]
+
+        cos = rotary_emb[0][:, start:end, :, :]
+        sin = rotary_emb[1][:, start:end, :, :]
+        rotary_emb = (cos, sin)
 
     # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
     if timestep.ndim == 2:
@@ -116,6 +137,27 @@ def WanTransformer3DModleForwardGaudi(
     # on.
     shift = shift.to(hidden_states.device)
     scale = scale.to(hidden_states.device)
+
+    if parallel_state.sequence_parallel_is_initialized():
+        cp_size = parallel_state.get_sequence_parallel_world_size()
+
+        gather_hidden = [torch.empty_like(hidden_states) for _ in range(cp_size)]
+        torch.distributed.all_gather(
+            gather_hidden,
+            hidden_states,
+            group=parallel_state.get_sequence_parallel_group(),
+            async_op=False,
+        )
+        hidden_states = torch.cat(gather_hidden, dim=1)
+
+        if expanded_timestep:
+            gather_shift = [torch.empty_like(shift) for _ in range(cp_size)]
+            torch.distributed.all_gather(gather_shift, shift)
+            shift = torch.cat(gather_shift, dim=1)
+
+            gather_scale = [torch.empty_like(scale) for _ in range(cp_size)]
+            torch.distributed.all_gather(gather_scale, scale)
+            scale = torch.cat(gather_scale, dim=1)
 
     hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
     hidden_states = self.proj_out(hidden_states)

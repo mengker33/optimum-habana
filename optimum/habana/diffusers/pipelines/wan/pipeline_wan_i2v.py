@@ -27,6 +27,7 @@ from diffusers.utils import logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 
+from ....distributed import parallel_state
 from ....transformers.gaudi_configuration import GaudiConfig
 from ....utils import HabanaProfile
 from ...models.attention_processor import GaudiWanAttnProcessor
@@ -164,6 +165,22 @@ class GaudiWanImageToVideoPipeline(GaudiDiffusionPipeline, WanImageToVideoPipeli
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
         latent_width = width // self.vae_scale_factor_spatial
+
+        def adjust_num_frame(t, h, w, cp_size):
+            # It is to make sure seq_len can be devided by cp_size.
+            MAX_T = t + 100
+            for t_i in range(t, MAX_T):
+                if (t_i * h * w) % cp_size == 0:
+                    return t_i
+            raise ValueError(f"No valid num_latent_frames found up to {MAX_T} for h={h}, w={w}, cp_size={cp_size}")
+
+        cp_size = parallel_state.get_sequence_parallel_world_size()
+        p_t, p_h, p_w = self.transformer.config.patch_size
+        tmp_seq_len = (num_latent_frames // p_t) * (latent_height // p_h) * (latent_width // p_w)
+        if tmp_seq_len % cp_size != 0:
+            num_latent_frames = adjust_num_frame(
+                num_latent_frames // p_t, latent_height // p_h, latent_width // p_w, cp_size
+            )
 
         shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
         if isinstance(generator, list) and len(generator) != batch_size:
@@ -380,6 +397,13 @@ class GaudiWanImageToVideoPipeline(GaudiDiffusionPipeline, WanImageToVideoPipeli
             )
             num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
+
+        # It is to ensure the latent width/height can be divided by patch size.
+        _, p_w, p_h = self.transformer.config.patch_size
+        if width // self.vae_scale_factor_spatial % p_w != 0:
+            width = (width // self.vae_scale_factor_spatial // p_w + 1) * p_w * self.vae_scale_factor_spatial
+        if height // self.vae_scale_factor_spatial % p_h != 0:
+            height = (height // self.vae_scale_factor_spatial // p_h + 1) * p_h * self.vae_scale_factor_spatial
 
         if self.config.boundary_ratio is not None and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale

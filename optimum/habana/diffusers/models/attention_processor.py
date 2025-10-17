@@ -22,8 +22,10 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models.transformers.transformer_wan import WanAttention, _get_added_kv_projections, _get_qkv_projections
 from diffusers.utils import deprecate, logging
 from diffusers.utils.import_utils import is_xformers_available
+from habana_frameworks.torch.hpex.kernels import FusedSDPA
 from torch import nn
 
+from ...distributed import parallel_state
 from .embeddings import RotaryPosEmbedding
 
 
@@ -206,8 +208,94 @@ class ModuleFusedSDPA(torch.nn.Module):
         super().__init__()
         self._hpu_kernel_fsdpa = fusedSDPA
 
-    def forward(self, query, key, value, attn_mask, dropout_p, is_casual, scale, softmax_mode):
-        return self._hpu_kernel_fsdpa.apply(query, key, value, attn_mask, dropout_p, is_casual, scale, softmax_mode)
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        attn_mask,
+        dropout_p,
+        is_causal,
+        scale,
+        softmax_mode,
+        recompute_mode,
+        valid_sequence_lengths,
+        padding_side="left",
+    ):
+        query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
+        out = self._hpu_kernel_fsdpa.apply(
+            query,
+            key,
+            value,
+            attn_mask,
+            dropout_p,
+            is_causal,
+            scale,
+            softmax_mode,
+            recompute_mode,
+            valid_sequence_lengths,
+            padding_side,
+        )
+        return out.permute(0, 2, 1, 3)
+
+
+class GaudiDistributedAttention(torch.nn.Module):
+    def __init__(
+        self, hpu_module_fsdpa: ModuleFusedSDPA, scale, attention_dropout, enable_recompute, flash_attention_fp8
+    ):
+        super().__init__()
+        self._hpu_module_fsdpa = hpu_module_fsdpa
+        if parallel_state.sequence_parallel_is_initialized() and parallel_state.get_sequence_parallel_world_size() > 1:
+            from deepspeed.sequence.layer import DistributedAttention
+
+            self._hpu_module_fsdpa_distributed = DistributedAttention(
+                self._hpu_module_fsdpa, parallel_state.get_sequence_parallel_group(), 2, 1
+            )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor,
+        dropout_p: float,
+        is_casual,
+        scale,
+        softmax_mode,
+        recompute_mode,
+        valid_sequence_lengths,
+        padding_side="left",
+    ):
+        if parallel_state.sequence_parallel_is_initialized() and parallel_state.get_sequence_parallel_world_size() > 1:
+            return self._hpu_module_fsdpa_distributed(
+                query,
+                key,
+                value,
+                0,  # As the shape for inputs is [B, S, N, H]
+                None,
+                attn_mask,
+                dropout_p,
+                is_casual,
+                scale,
+                softmax_mode,
+                recompute_mode,
+                valid_sequence_lengths,
+                padding_side,
+            )
+        else:
+            return self._hpu_module_fsdpa(
+                query,
+                key,
+                value,
+                attn_mask,
+                dropout_p,
+                is_casual,
+                scale,
+                softmax_mode,
+                recompute_mode,
+                valid_sequence_lengths,
+                padding_side,
+            )
 
 
 class CogVideoXAttnProcessorGaudi:
@@ -262,9 +350,9 @@ class CogVideoXAttnProcessorGaudi:
 
         softmax_mode = "None" if attn.training else "fast"
         hidden_states = self.fused_scaled_dot_product_attention(
-            query,
-            key,
-            value,
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
             attn_mask=attention_mask,
             dropout_p=0.0,
             is_casual=False,
@@ -272,7 +360,7 @@ class CogVideoXAttnProcessorGaudi:
             softmax_mode=softmax_mode,
         )
 
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.reshape(batch_size, -1, attn.heads * head_dim)
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
@@ -553,6 +641,21 @@ class GaudiWanAttnProcessor:
                 "WanAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to version 2.0 or higher."
             )
         self.is_training = is_training
+        self.fused_scaled_dot_product_attention = ModuleFusedSDPA(FusedSDPA) if FusedSDPA else None
+
+        self.fused_scaled_dot_product_attention_distributed = None
+        if parallel_state.sequence_parallel_is_initialized() and parallel_state.get_sequence_parallel_world_size() > 1:
+            self.fused_scaled_dot_product_attention_distributed = (
+                GaudiDistributedAttention(
+                    self.fused_scaled_dot_product_attention,
+                    scale=None,
+                    attention_dropout=False,
+                    enable_recompute=False,
+                    flash_attention_fp8=False,
+                )
+                if FusedSDPA
+                else None
+            )
 
     def _native_attention(
         self,
@@ -565,14 +668,27 @@ class GaudiWanAttnProcessor:
         scale: Optional[float] = None,
         enable_gqa: bool = False,
     ) -> torch.Tensor:
-        # apply gaudi fused SDPA
-        from habana_frameworks.torch.hpex.kernels import FusedSDPA
-
         # Fast FSDPA is not supported in training mode
         fsdpa_mode = "None" if self.is_training else "fast"
-        query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
-        out = FusedSDPA.apply(query, key, value, attn_mask, dropout_p, is_causal, scale, fsdpa_mode, None)
-        out = out.permute(0, 2, 1, 3)
+
+        if self.fused_scaled_dot_product_attention_distributed:
+            out = self.fused_scaled_dot_product_attention_distributed(
+                query,
+                key,
+                value,
+                attn_mask,
+                0.0,
+                False,
+                None,
+                "None",
+                False,
+                None,
+                "None",
+            )
+        else:
+            query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
+            out = FusedSDPA.apply(query, key, value, attn_mask, dropout_p, is_causal, scale, fsdpa_mode, None)
+            out = out.permute(0, 2, 1, 3)
         return out
 
     def __call__(
