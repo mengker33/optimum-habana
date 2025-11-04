@@ -31,7 +31,7 @@ from ....transformers.gaudi_configuration import GaudiConfig
 from ....utils import HabanaProfile
 from ...models.attention_processor import GaudiWanAttnProcessor
 from ...models.autoencoders.autoencoder_kl_wan import WanDecoder3dForwardGaudi, WanDupUp3DForwardGaudi
-from ...models.wan_transformer_3d import WanTransformer3DModleForwardGaudi
+from ...models.wan_transformer_3d import WanTransformer3DModleForwardGaudi, WanTransformerBlockForwardGaudi
 from ..pipeline_utils import GaudiDiffusionPipeline
 
 
@@ -120,11 +120,13 @@ class GaudiWanPipeline(GaudiDiffusionPipeline, WanPipeline):
         if self.transformer is not None:
             self.transformer.forward = types.MethodType(WanTransformer3DModleForwardGaudi, self.transformer)
             for block in self.transformer.blocks:
+                block.forward = types.MethodType(WanTransformerBlockForwardGaudi, block)
                 block.attn1.processor = GaudiWanAttnProcessor(is_training)
                 block.attn2.processor = GaudiWanAttnProcessor(is_training)
         if self.transformer_2 is not None:
             self.transformer_2.forward = types.MethodType(WanTransformer3DModleForwardGaudi, self.transformer_2)
             for block in self.transformer_2.blocks:
+                block.forward = types.MethodType(WanTransformerBlockForwardGaudi, block)
                 block.attn1.processor = GaudiWanAttnProcessor(is_training)
                 block.attn2.processor = GaudiWanAttnProcessor(is_training)
         self.vae.decoder.forward = types.MethodType(WanDecoder3dForwardGaudi, self.vae.decoder)
