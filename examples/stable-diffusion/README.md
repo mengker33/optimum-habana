@@ -480,6 +480,8 @@ python image_to_video_generation.py \
 ```
 
 Multi-cards with DeepSpeed Ulysses can help to accelerate the inference speed.
+Note that if you want to enable mask when using DeepSpeed Ulysses cp, please set CP_USE_MASK=1.
+
 ```bash
 PT_HPU_SYNC_LAUNCH=1 \
 PT_HPU_LAZY_MODE=1 \
@@ -518,6 +520,28 @@ python text_to_video_generation.py \
     --guidance_scale 5.0 \
     --output_type mp4 \
     --dtype bf16
+```
+
+Multi-cards with DeepSpeed Ulysses can help to accelerate the inference speed.
+Note that if you want to enable mask when using DeepSpeed Ulysses cp, please set CP_USE_MASK=1.
+
+```bash
+PT_HPU_SYNC_LAUNCH=1 \
+PT_HPU_LAZY_MODE=1 \
+python ../gaudi_spawn.py --world_size 2 text_to_video_generation.py \
+    --model_name_or_path "Wan-AI/Wan2.2-TI2V-5B-Diffusers" \
+    --prompts "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
+    --pipeline_type wan \
+    --num_videos_per_prompt 1 \
+    --use_habana \
+    --height 704 \
+    --width 1280 \
+    --num_frames 121 \
+    --num_inference_steps 50 \
+    --guidance_scale 5.0 \
+    --output_type mp4 \
+    --dtype bf16 \
+    --context_parallel_size 2
 ```
 
 ### Text-to-Video with CogvideoX

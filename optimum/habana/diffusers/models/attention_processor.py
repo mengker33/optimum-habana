@@ -645,7 +645,9 @@ class GaudiWanAttnProcessor:
         self.fused_scaled_dot_product_attention = ModuleFusedSDPA(FusedSDPA) if FusedSDPA else None
 
         self.fused_scaled_dot_product_attention_distributed = None
-        if parallel_state.sequence_parallel_is_initialized() and parallel_state.get_sequence_parallel_world_size() > 1:
+
+        if parallel_state.sequence_parallel_is_initialized() \
+            and parallel_state.get_sequence_parallel_world_size() > 1:
             self.fused_scaled_dot_product_attention_distributed = (
                 GaudiDistributedAttention(self.fused_scaled_dot_product_attention)
                 if FusedSDPA
