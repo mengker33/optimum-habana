@@ -643,11 +643,12 @@ class GaudiWanAttnProcessor:
             )
         self.is_training = is_training
         self.fused_scaled_dot_product_attention = ModuleFusedSDPA(FusedSDPA) if FusedSDPA else None
-
         self.fused_scaled_dot_product_attention_distributed = None
+        self.use_sp = os.getenv("USE_SP", "True").lower() not in ("0", "false", "False")
+        self.cp_size = parallel_state.get_sequence_parallel_world_size()
 
-        if parallel_state.sequence_parallel_is_initialized() \
-            and parallel_state.get_sequence_parallel_world_size() > 1:
+        if not self.use_sp and parallel_state.sequence_parallel_is_initialized() \
+            and self.cp_size > 1:
             self.fused_scaled_dot_product_attention_distributed = (
                 GaudiDistributedAttention(self.fused_scaled_dot_product_attention)
                 if FusedSDPA
@@ -748,7 +749,38 @@ class GaudiWanAttnProcessor:
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
+        # Add traditional SP:
+        if self.use_sp and self.cp_size > 1:
+            bs, kv_seq, num_head, head_dim = key.shape
+            key = key.reshape(bs, kv_seq, -1)
+            value = value.reshape(bs, kv_seq, -1)
+            full_key = torch.empty(bs, kv_seq * self.cp_size, num_head * head_dim, dtype=key.dtype, device=key.device)
+            full_value = torch.empty(bs, kv_seq * self.cp_size, num_head * head_dim, dtype=value.dtype, device=value.device)
+            gather1 = torch.distributed.all_gather_into_tensor(
+                full_key,
+                key,
+                group=parallel_state.get_sequence_parallel_group(),
+                async_op=True,
+            )
+            torch.distributed.all_gather_into_tensor(
+                full_value,
+                value,
+                group=parallel_state.get_sequence_parallel_group(),
+                async_op=False,
+            )
+            gather1.wait()
+            key = full_key.reshape(bs, kv_seq * self.cp_size, num_head, head_dim)
+            value = full_value.reshape(bs, kv_seq * self.cp_size, num_head, head_dim)
+
+            if attention_mask is not None:
+                logger.warning(f"Applying attention_mask in SP is not well supported, set it as None.")
+                attention_mask = None
+
         hidden_states = self._native_attention(query, key, value, attention_mask, 0.0, False, None)
+
+        if self.use_sp and self.cp_size > 1:
+            torch.hpu.synchronize()
+
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
