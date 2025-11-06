@@ -479,13 +479,12 @@ python image_to_video_generation.py \
     --bf16 
 ```
 
-Multi-cards with DeepSpeed Ulysses can help to accelerate the inference speed.
-Note that if you want to enable mask when using DeepSpeed Ulysses cp, please set CP_USE_MASK=1.
+For multi-cards inference, we support both traditional sequence parallelism (SP) and DeepSpeed Ulysses to accelerate the inference. Traditional SP is the default one, if you want to apply DeepSpeed Ulysses, please set USE_SP=0.
+When using DeepSpeed Ulysses, please set PT_HPU_SYNC_LAUNCH=1 to reduce memory consumption. Besides, to slightly improve the accuracy in DeepSpeed Ulysses case, you can enable the mask by setting CP_USE_MASK=1.
 
 ```bash
-PT_HPU_SYNC_LAUNCH=1 \
 PT_HPU_LAZY_MODE=1 \
-torchrun --nproc-per-node 2 image_to_video_generation.py \
+python ../gaudi_spawn.py --world_size 2  image_to_video_generation.py \
     --model_name_or_path "Wan-AI/Wan2.2-TI2V-5B-Diffusers" \
     --image_path "https://raw.githubusercontent.com/Wan-Video/Wan2.2/main/examples/i2v_input.JPG" \
     --video_save_dir ./wan2.2-output \
@@ -522,11 +521,10 @@ python text_to_video_generation.py \
     --dtype bf16
 ```
 
-Multi-cards with DeepSpeed Ulysses can help to accelerate the inference speed.
-Note that if you want to enable mask when using DeepSpeed Ulysses cp, please set CP_USE_MASK=1.
+For multi-cards inference, we support both traditional sequence parallelism (SP) and DeepSpeed Ulysses to accelerate the inference. Traditional SP is the default one, if you want to apply DeepSpeed Ulysses, please set USE_SP=0.
+When using DeepSpeed Ulysses, please set PT_HPU_SYNC_LAUNCH=1 to reduce memory consumption. Besides, to slightly improve the accuracy in DeepSpeed Ulysses case, you can enable the mask by setting CP_USE_MASK=1.
 
 ```bash
-PT_HPU_SYNC_LAUNCH=1 \
 PT_HPU_LAZY_MODE=1 \
 python ../gaudi_spawn.py --world_size 2 text_to_video_generation.py \
     --model_name_or_path "Wan-AI/Wan2.2-TI2V-5B-Diffusers" \
