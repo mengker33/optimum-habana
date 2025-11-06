@@ -30,7 +30,11 @@ from ....distributed import parallel_state
 from ....transformers.gaudi_configuration import GaudiConfig
 from ....utils import HabanaProfile
 from ...models.attention_processor import GaudiWanAttnProcessor
-from ...models.autoencoders.autoencoder_kl_wan import WanDecoder3dForwardGaudi, WanDupUp3DForwardGaudi
+from ...models.autoencoders.autoencoder_kl_wan import (
+    WanDecoder3dForwardGaudi,
+    WanDupUp3DForwardGaudi,
+    WanAttentionBlockForwardGaudi,
+)
 from ...models.wan_transformer_3d import WanTransformer3DModleForwardGaudi, WanTransformerBlockForwardGaudi
 from ..pipeline_utils import GaudiDiffusionPipeline
 
@@ -133,6 +137,12 @@ class GaudiWanPipeline(GaudiDiffusionPipeline, WanPipeline):
         for block in self.vae.decoder.up_blocks:
             if type(block) is WanResidualUpBlock and block.avg_shortcut is not None:
                 block.avg_shortcut.forward = types.MethodType(WanDupUp3DForwardGaudi, block.avg_shortcut)
+
+        for attn in self.vae.decoder.mid_block.attentions:
+            attn.forwward = types.MethodType(WanAttentionBlockForwardGaudi, attn)
+
+        for attn in self.vae.encoder.mid_block.attentions:
+            attn.forwward = types.MethodType(WanAttentionBlockForwardGaudi, attn)
 
         if use_hpu_graphs:
             from habana_frameworks.torch.hpu import wrap_in_hpu_graph
