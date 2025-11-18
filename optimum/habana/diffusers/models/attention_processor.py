@@ -107,6 +107,7 @@ class FlashAttnV3Gaudi:
         attention_mask: Optional[torch.Tensor] = None,
         fsdpa_mode: str = "fast",
         cp_size: int = 1,
+        pad_len: int = 0,
         ) -> torch.Tensor:
 
         # Change to (batch, heads, seq_len, head_dim)
@@ -131,6 +132,11 @@ class FlashAttnV3Gaudi:
  
         #Flash Attention V3 for Full Attention
         linv_factor = 128.0 if fsdpa_mode == "fast" else 1.0
+
+        if pad_len > 0:
+            key = key[:, :, :-pad_len, :]
+            value = value[:, :, :-pad_len, :]
+            key_len = key.size(-2)
 
         num_query_chunk = int((query_len - 1) / self.q_chunk) + 1
         num_kv_chunk = int((key_len - 1) / self.kv_chunk) + 1
@@ -164,17 +170,18 @@ class FlashAttnV3Gaudi:
                     1 / math.sqrt(query.shape[-1]),
                     False,
                     True,
-                    "fast",
+                    fsdpa_mode,
                     None, #vsl,
                     "left",
                 )
 
                 if kv_idx == 0:
                     out = block_out.to(torch.float32)
-                    m = block_m
-                    linv = block_linv * linv_factor
+                    m = block_m.to(torch.float32)
+                    linv = block_linv.to(torch.float32) * linv_factor
                 else:
-                    block_linv = block_linv * linv_factor
+                    block_linv = block_linv.to(torch.float32) * linv_factor
+                    block_m = block_m.to(torch.float32)
                     block_out = block_out.to(torch.float32)
                     new_m = torch.maximum(m, block_m)
                     l_rescaled = (1.0 / linv) * torch.exp(m - new_m)
@@ -795,6 +802,7 @@ class GaudiWanAttnProcessor:
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        pad_len: int = 0,
     ) -> torch.Tensor:
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -874,7 +882,8 @@ class GaudiWanAttnProcessor:
                 logger.warning(f"Applying attention_mask in SP is not well supported, set it as None.")
                 attention_mask = None
 
-        hidden_states = self.fav3.forward(query, key, value, fsdpa_mode="fast", cp_size=self.cp_size)
+        hidden_states = self.fav3.forward(query, key, value, attention_mask, fsdpa_mode="fast",
+                                          cp_size=self.cp_size, pad_len=pad_len)
 
         if self.use_sp and self.cp_size > 1:
             torch.hpu.synchronize()
