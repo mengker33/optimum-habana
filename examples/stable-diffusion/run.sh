@@ -21,7 +21,7 @@ PT_HPU_LAZY_MODE=1 deepspeed --num_nodes 1 \
     --output_type mp4 \
     --video_save_dir $out_dir \
     --dtype bf16 \
-    --context_parallel_size $rank
+    --context_parallel_size $rank \
     --quant_mode "measure" \
     --quant_config "quantization/wan/measure_config.json" \
     --quant_config_2 "quantization/wan/measure_config_2.json"
