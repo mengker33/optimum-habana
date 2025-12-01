@@ -230,8 +230,6 @@ def main():
                 pipeline.transformer_2 = prepare(pipeline.transformer_2, config_2)
             elif config_2.quantize:
                 pipeline.transformer_2 = convert(pipeline.transformer_2, config_2)
-        print(pipeline.transformer)
-        print(pipeline.transformer_2)
 
     set_seed(args.seed)
     outputs = pipeline(
