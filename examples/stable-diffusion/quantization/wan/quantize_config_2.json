@@ -1,0 +1,10 @@
+{
+    "method": "HOOKS",
+    "mode": "QUANTIZE",
+    "scale_method": "maxabs_hw_opt_weight",
+    "blocklist": {
+        "types": [],
+        "names":  ["proj_out", "embedder"]
+    },
+    "dump_stats_path": "quantization/wan/measure_2/fp8"
+}
