@@ -125,7 +125,7 @@ class FlashAttnV3Gaudi:
                 0.0,
                 False,
                 None,
-                fsdpa_mode,
+                "fast",
                 None
             )
             return output.permute(0, 2, 1, 3).contiguous()
@@ -170,7 +170,7 @@ class FlashAttnV3Gaudi:
                     1 / math.sqrt(query.shape[-1]),
                     False,
                     True,
-                    fsdpa_mode,
+                    "fast",
                     None, #vsl,
                     "left",
                 )
@@ -728,6 +728,22 @@ class GaudiFluxAttnProcessor2_0:
         else:
             return hidden_states
 
+def send_recv(send_tensor: torch.Tensor, recv_tensor: Optional[torch.Tensor] = None, \
+              send_rank: int = 0, recv_rank: int = 0, process_group = None):
+    if recv_tensor is None:
+        res = torch.empty_like(send_tensor)
+    else:
+        res = recv_tensor
+
+    send_op = torch.distributed.P2POp(torch.distributed.isend, send_tensor, send_rank, group=process_group)
+    recv_op = torch.distributed.P2POp(torch.distributed.irecv, res, recv_rank, group=process_group)
+
+    return send_op, recv_op, res
+
+def wait(reqs = None):
+    for req in reqs:
+        req.wait()
+
 
 class GaudiWanAttnProcessor:
     r"""
@@ -837,9 +853,12 @@ class GaudiWanAttnProcessor:
                 return out.type_as(hidden_states)
             """
             from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
-
-            query = apply_rotary_pos_emb(query, *rotary_emb, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
-            key = apply_rotary_pos_emb(key, *rotary_emb, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+            cos = rotary_emb[0].float()
+            sin = rotary_emb[1].float()
+            rotary_emb = (cos, sin)
+            # print(f"-------------rot_emd dtype: {rotary_emb[0].dtype}")
+            query = apply_rotary_pos_emb(query.float(), *rotary_emb, None, 0, RotaryPosEmbeddingMode.PAIRWISE).type_as(query)
+            key = apply_rotary_pos_emb(key.float(), *rotary_emb, None, 0, RotaryPosEmbeddingMode.PAIRWISE).type_as(query)
 
         # I2V task
         hidden_states_img = None
@@ -856,7 +875,94 @@ class GaudiWanAttnProcessor:
             hidden_states_img = hidden_states_img.type_as(query)
 
         # Add traditional SP:
-        if self.use_sp and self.cp_size > 1:
+        # use_ring = True if query.shape[1] == key.shape[1] else False
+        use_ring = False
+        if use_ring and self.cp_size > 1:
+            rank = parallel_state.get_sequence_parallel_rank()
+            group = parallel_state.get_sequence_parallel_group()
+            send_rank = (rank + 1) % self.cp_size
+            recv_rank = (rank - 1 + self.cp_size) % self.cp_size
+            query_local = query.permute(0, 2, 1, 3).contiguous()
+            key_local = key.permute(0, 2, 1, 3).contiguous()
+            value_local = value.permute(0, 2, 1, 3).contiguous()
+
+            # buffers for receiving the next shard
+            k_recv = torch.empty_like(key_local)
+            v_recv = torch.empty_like(value_local)
+
+            query_len = query_local.size(-2)
+            # num_query_chunk = int((query_len - 1) / self.fav3.q_chunk) + 1
+            num_query_chunk = 1
+            final_hidden_list = []
+
+            for query_idx in range(num_query_chunk):
+
+                query_start = query_idx * self.fav3.q_chunk
+                query_end = (query_idx + 1) * self.fav3.q_chunk if query_idx < num_query_chunk - 1 else query_len
+                query_slice = query_local[..., query_start:query_end, :]
+                out = None
+                m = None
+                linv = None
+                linv_factor = 128.0
+
+                for i in range(self.cp_size):
+                    if i < self.cp_size - 1:
+                        send_k, recv_k, k_recv = send_recv(key_local, None, send_rank, recv_rank, group)
+                        send_v, recv_v, v_recv = send_recv(value_local, None, send_rank, recv_rank, group)
+
+                        ops_k = [send_k, recv_k]
+                        ops_v = [send_v, recv_v]
+
+                        reqs_k = torch.distributed.batch_isend_irecv(ops_k)
+                        reqs_v = torch.distributed.batch_isend_irecv(ops_v)
+                    elif pad_len > 0:
+                        key_local = key_local[:, :, :-pad_len, :]
+                        value_local = value_local[:, :, :-pad_len, :]
+
+                    # Compute attention on the current rank
+                    block_out, block_m, block_linv, _ = torch.ops.hpu.sdpa_recomp_fwd(
+                        query_local,
+                        key_local,
+                        value_local,
+                        None,
+                        0.0,
+                        1 / math.sqrt(query.shape[-1]),
+                        False,
+                        True,
+                        "fast",
+                        None, #vsl,
+                        "left",
+                    )
+
+                    if i == 0:
+                        out = block_out.to(torch.float32)
+                        m = block_m.to(torch.float32)
+                        linv = block_linv.to(torch.float32) * linv_factor
+                    else:
+                        block_linv = block_linv.to(torch.float32) * linv_factor
+                        block_m = block_m.to(torch.float32)
+                        block_out = block_out.to(torch.float32)
+                        new_m = torch.maximum(m, block_m)
+                        l_rescaled = (1.0 / linv) * torch.exp(m - new_m)
+                        block_l_rescaled = (1.0 / block_linv) * torch.exp(block_m - new_m)
+                        new_linv = 1.0 / (l_rescaled + block_l_rescaled)
+                        out = (l_rescaled * new_linv) * out + (block_l_rescaled * new_linv) * block_out
+                        linv = new_linv
+                        m = new_m
+
+                    # If this is the last hop, stop rotating
+                    if i == self.cp_size - 1:
+                        hidden_states = out.permute(0, 2, 1, 3).contiguous()
+                        break
+
+                    wait(reqs_k)
+                    wait(reqs_v)
+
+                    # Now the newly rotated shard is used in next hop
+                    key_local, value_local = k_recv, v_recv
+                # final_hidden_list.append(hidden_states.to(query.dtype))
+            # hidden_states = torch.cat(final_hidden_list, dim=1)
+        elif self.use_sp and self.cp_size > 1:
             bs, kv_seq, num_head, head_dim = key.shape
             key = key.reshape(bs, kv_seq, -1)
             value = value.reshape(bs, kv_seq, -1)
@@ -882,8 +988,9 @@ class GaudiWanAttnProcessor:
                 logger.warning(f"Applying attention_mask in SP is not well supported, set it as None.")
                 attention_mask = None
 
-        hidden_states = self.fav3.forward(query, key, value, attention_mask, fsdpa_mode="fast",
-                                          cp_size=self.cp_size, pad_len=pad_len)
+        if not use_ring:
+            hidden_states = self.fav3.forward(query, key, value, attention_mask, fsdpa_mode="fast",
+                                            cp_size=self.cp_size, pad_len=pad_len)
 
         if self.use_sp and self.cp_size > 1:
             torch.hpu.synchronize()

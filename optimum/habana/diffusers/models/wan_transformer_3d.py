@@ -110,7 +110,7 @@ def WanTransformer3DModleForwardGaudi(
         cos = rotary_emb[0][:, start:end, :, :]
         sin = rotary_emb[1][:, start:end, :, :]
         rotary_emb = (cos, sin)
-
+    # print(f"-0000000000000 cos shape: {rotary_emb[0].shape}")
     # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
     if timestep.ndim == 2:
         ts_seq_len = timestep.shape[1]
