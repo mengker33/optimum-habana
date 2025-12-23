@@ -27,6 +27,7 @@ from optimum.habana.diffusers import GaudiCogVideoXPipeline, GaudiTextToVideoSDP
 from optimum.habana.distributed import parallel_state
 from optimum.habana.transformers.gaudi_configuration import GaudiConfig
 from optimum.habana.utils import set_seed
+import pandas as pd
 
 
 try:
@@ -169,6 +170,7 @@ def main():
         choices=["bf16", "fp32", "autocast_bf16"],
         help="Which runtime dtype to perform generation in.",
     )
+
     args = parser.parse_args()
     # Setup logging
     logging.basicConfig(
@@ -232,15 +234,36 @@ def main():
                 pipeline.transformer_2 = convert(pipeline.transformer_2, config_2)
 
     set_seed(args.seed)
-    outputs = pipeline(
-        prompt=args.prompts,
-        num_videos_per_prompt=args.num_videos_per_prompt,
-        num_inference_steps=args.num_inference_steps,
-        guidance_scale=args.guidance_scale,
-        negative_prompt=args.negative_prompts,
-        output_type="np" if args.output_type == "mp4" else args.output_type,
-        **kwargs_call,
-    )
+    if args.quant_mode == "measure":
+        df = pd.read_csv("wan_prompt.tsv", sep="\t")
+        prompts = []
+        idx = 1
+        for index, row in df.iterrows():
+            if idx > 16:
+                break
+            assert "id" in row and "caption" in row
+            caption_text = row["caption"]
+
+            outputs = pipeline(
+                prompt=caption_text,
+                num_videos_per_prompt=args.num_videos_per_prompt,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                output_type="np" if args.output_type == "mp4" else args.output_type,
+                **kwargs_call,
+            )
+            idx += 1
+
+    else:
+        outputs = pipeline(
+            prompt=args.prompts,
+            num_videos_per_prompt=args.num_videos_per_prompt,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            negative_prompt=args.negative_prompts,
+            output_type="np" if args.output_type == "mp4" else args.output_type,
+            **kwargs_call,
+        )
 
     if args.quant_mode == "measure":
         from neural_compressor.torch.quantization import finalize_calibration

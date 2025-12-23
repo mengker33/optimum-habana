@@ -1,7 +1,8 @@
 {
     "method": "HOOKS",
     "mode": "QUANTIZE",
-    "scale_method": "maxabs_hw_opt_weight",
+    "scale_method": "MAXABS_HW",
+    "scale_format": "const",
     "blocklist": {
         "types": [],
         "names":  ["proj_out", "embedder"]

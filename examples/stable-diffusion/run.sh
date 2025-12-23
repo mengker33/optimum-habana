@@ -1,4 +1,4 @@
-model=/software/users/mengni/Wan2.2-T2V-A14B-Diffusers/
+model=/data/Wan2.2-T2V-A14B-Diffusers/
 port=30088
 rank=4
 out_dir=14b_720p_cp$rank 
