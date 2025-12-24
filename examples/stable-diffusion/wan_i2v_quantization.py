@@ -64,6 +64,13 @@ def main():
         help="The prompt to guide the video generation.",
     )
     parser.add_argument(
+        "--negative_prompts",
+        type=str,
+        nargs="*",
+        default="Distorted, discontinuous, Ugly, blurry, low resolution, motionless, static, disfigured, disconnected limbs, Ugly faces, incomplete arms",
+        help="The prompt or prompts not to guide the image generation.",
+    )
+    parser.add_argument(
         "--image_path",
         type=str,
         help="The image to guide the video generation.",
@@ -96,6 +103,15 @@ def main():
             "Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598)."
             " Higher guidance scale encourages to generate videos that are closely linked to the text `prompt`,"
             " usually at the expense of lower video quality."
+        ),
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=16,
+        help=(
+            "Frames per second. The rate at which the generated images shall be exported to a video after generation."
+            " Note that Stable Diffusion Video's UNet was micro-conditioned on fps-1 during training."
         ),
     )
     parser.add_argument(
@@ -149,7 +165,13 @@ def main():
         default=None,
         help="Quantization config for transformer_2.",
     )
- 
+    parser.add_argument(
+        "--num_calib_sample",
+        type=int,
+        default=2,
+        help="Number of sample data used for the calibration.",
+    )
+
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization.")
 
     # HPU-specific arguments
@@ -232,13 +254,17 @@ def main():
 
     set_seed(args.seed)
     max_area = args.max_area
+
+    generator= torch.Generator("cpu")
+    generator.manual_seed(args.seed)
+
     if args.quant_mode == "measure":
         import pandas as pd
         from datasets import load_dataset
 
         ds = load_dataset("WenhaoWang/TIP-I2V", split='Eval', streaming=True)
         df = pd.DataFrame(ds)
-        for i in range(16):
+        for i in range(args.num_calib_sample):
             prompt = df["Text_Prompt"][i]
             image = df["Image_Prompt"][i]
 
@@ -247,6 +273,7 @@ def main():
             height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
             width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
             image = image.resize((width, height))
+
             outputs = pipeline(
                     image=image,
                     prompt=prompt,
@@ -254,8 +281,10 @@ def main():
                     num_inference_steps=args.num_inference_steps,
                     height=height,
                     width=width,
-                    num_frames=81,
+                    num_frames=args.num_frames,
                     guidance_scale=5.0,
+                    negative_prompt=args.negative_prompts,
+                    generator=generator,
                 )
     else:
         image = load_image(args.image_path)
@@ -264,7 +293,7 @@ def main():
         height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
         width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
         image = image.resize((width, height))
- 
+
         outputs = pipeline(
                 image=image,
                 prompt=args.prompt,
@@ -272,8 +301,10 @@ def main():
                 num_inference_steps=args.num_inference_steps,
                 height=height,
                 width=width,
-                num_frames=81,
+                num_frames=args.num_frames,
                 guidance_scale=5.0,
+                negative_prompt=args.negative_prompts,
+                generator=generator,
             )
     if args.quant_mode == "measure":
         from neural_compressor.torch.quantization import finalize_calibration
@@ -293,7 +324,7 @@ def main():
 
             for i, video in enumerate(outputs.frames):
                 filename = video_save_dir / f"{args.filename}_{i + 1}.mp4"
-                export_to_video(video, str(filename.resolve()), fps=16)
+                export_to_video(video, str(filename.resolve()), fps=args.fps)
         else:
             logger.warning("--output_type should be equal to 'mp4' to save videos in --video_save_dir.")
 
