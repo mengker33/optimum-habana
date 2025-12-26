@@ -19,15 +19,16 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+import time
 
+import pandas as pd
 import torch
 from diffusers.utils.export_utils import export_to_video
 
-from optimum.habana.diffusers import GaudiCogVideoXPipeline, GaudiTextToVideoSDPipeline, GaudiWanPipeline
+from optimum.habana.diffusers import GaudiWanPipeline
 from optimum.habana.distributed import parallel_state
 from optimum.habana.transformers.gaudi_configuration import GaudiConfig
 from optimum.habana.utils import set_seed
-import pandas as pd
 
 
 try:
@@ -99,6 +100,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--fps",
+        type=int,
+        default=16,
+        help=(
+            "Frames per second. The rate at which the generated images shall be exported to a video after generation."
+            " Note that Stable Diffusion Video's UNet was micro-conditioned on fps-1 during training."
+        ),
+    )
+    parser.add_argument(
         "--negative_prompts",
         type=str,
         nargs="*",
@@ -156,7 +166,13 @@ def main():
         default=None,
         help="Quantization config for transformer_2.",
     )
- 
+    parser.add_argument(
+        "--num_calib_sample",
+        type=int,
+        default=2,
+        help="Number of sample data used for the calibration.",
+    )
+
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization.")
 
     # HPU-specific arguments
@@ -169,6 +185,12 @@ def main():
         default="bf16",
         choices=["bf16", "fp32", "autocast_bf16"],
         help="Which runtime dtype to perform generation in.",
+    )
+    parser.add_argument(
+        "--loop",
+        type=int,
+        default=1,
+        help="Number of benchmark loops for generation.",
     )
 
     args = parser.parse_args()
@@ -234,12 +256,15 @@ def main():
                 pipeline.transformer_2 = convert(pipeline.transformer_2, config_2)
 
     set_seed(args.seed)
+
+    generator= torch.Generator("cpu")
+    generator.manual_seed(args.seed)
+
     if args.quant_mode == "measure":
         df = pd.read_csv("wan_prompt.tsv", sep="\t")
-        prompts = []
         idx = 1
         for index, row in df.iterrows():
-            if idx > 16:
+            if idx > args.num_calib_sample:
                 break
             assert "id" in row and "caption" in row
             caption_text = row["caption"]
@@ -249,21 +274,32 @@ def main():
                 num_videos_per_prompt=args.num_videos_per_prompt,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
+                negative_prompt=args.negative_prompts,
+                generator=generator,
                 output_type="np" if args.output_type == "mp4" else args.output_type,
                 **kwargs_call,
             )
             idx += 1
 
     else:
-        outputs = pipeline(
-            prompt=args.prompts,
-            num_videos_per_prompt=args.num_videos_per_prompt,
-            num_inference_steps=args.num_inference_steps,
-            guidance_scale=args.guidance_scale,
-            negative_prompt=args.negative_prompts,
-            output_type="np" if args.output_type == "mp4" else args.output_type,
-            **kwargs_call,
-        )
+        for i in range(args.loop):
+            t0 = time.time()
+            outputs = pipeline(
+                prompt=args.prompts,
+                num_videos_per_prompt=args.num_videos_per_prompt,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                negative_prompt=args.negative_prompts,
+                generator=generator,
+                output_type="np" if args.output_type == "mp4" else args.output_type,
+                **kwargs_call,
+            )
+            torch.hpu.synchronize()
+            t1 = time.time()
+            duration = t1 - t0
+
+            if (args.context_parallel_size > 1 and torch.distributed.get_rank() == 0) or args.context_parallel_size == 1:
+                print("Wan Pipeline FP8 Latency in loop #{:d}: {:.1f} sec".format(i, duration))
 
     if args.quant_mode == "measure":
         from neural_compressor.torch.quantization import finalize_calibration
@@ -285,7 +321,7 @@ def main():
 
             for i, video in enumerate(outputs.frames):
                 filename = video_save_dir / f"wan_video_{i + 1}.mp4"
-                export_to_video(video, str(filename.resolve()), fps=16)
+                export_to_video(video, str(filename.resolve()), fps=args.fps)
         else:
             logger.warning("--output_type should be equal to 'mp4' to save videos in --video_save_dir.")
 
