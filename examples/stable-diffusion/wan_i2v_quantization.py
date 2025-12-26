@@ -18,6 +18,7 @@
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 import numpy as np
 
@@ -197,6 +198,12 @@ def main():
         default="WenhaoWang/TIP-I2V",
         help="The directory where videos will be saved.",
     )
+    parser.add_argument(
+        "--loop",
+        type=int,
+        default=1,
+        help="Number of benchmark loops for generation.",
+    )
 
 
     args = parser.parse_args()
@@ -294,18 +301,27 @@ def main():
         width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
         image = image.resize((width, height))
 
-        outputs = pipeline(
-                image=image,
-                prompt=args.prompt,
-                num_videos_per_prompt=args.num_videos_per_prompt,
-                num_inference_steps=args.num_inference_steps,
-                height=height,
-                width=width,
-                num_frames=args.num_frames,
-                guidance_scale=5.0,
-                negative_prompt=args.negative_prompts,
-                generator=generator,
-            )
+        for i in range(args.loop):
+            t0 = time.time()
+            outputs = pipeline(
+                    image=image,
+                    prompt=args.prompt,
+                    num_videos_per_prompt=args.num_videos_per_prompt,
+                    num_inference_steps=args.num_inference_steps,
+                    height=height,
+                    width=width,
+                    num_frames=args.num_frames,
+                    guidance_scale=5.0,
+                    negative_prompt=args.negative_prompts,
+                    generator=generator,
+               )
+            torch.hpu.synchronize()
+            t1 = time.time()
+            duration = t1 - t0
+
+            if (args.context_parallel_size > 1 and torch.distributed.get_rank() == 0) or args.context_parallel_size == 1:
+                print("Wan Pipeline FP8 Latency in loop #{:d}: {:.1f} sec".format(i, duration))
+
     if args.quant_mode == "measure":
         from neural_compressor.torch.quantization import finalize_calibration
         if pipeline.transformer is not None:
