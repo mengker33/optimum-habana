@@ -555,6 +555,19 @@ Then, start the inference with the quantized model:
 bash ./quant_script/i2v_480p_quant.sh
 ```
 
+### FP8 Text-to-Video with Wan 2.1/Wan2.2
+There are example scripts under quant_scripts folder to run static quantization of Wan2.2 T2V tasks for 720p;
+Note that it is recommended to set PT_HPU_SYNC_LAUNCH=1, which helps to reduce the memory consumption in some cases.
+
+First, run the calibration:
+```bash
+bash ./quant_script/t2v_run.sh
+```
+Then, start the inference with the quantized model:
+```bash
+bash ./quant_script/t2v_quant.sh
+```
+
 ### Text-to-Video with CogvideoX
 
 CogVideoX is an open-source version of the video generation model originating from QingYing, unveiled in https://huggingface.co/THUDM/CogVideoX-5b.
