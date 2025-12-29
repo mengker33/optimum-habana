@@ -269,7 +269,7 @@ def main():
         import pandas as pd
         from datasets import load_dataset
 
-        ds = load_dataset("WenhaoWang/TIP-I2V", split='Eval', streaming=True)
+        ds = load_dataset(args.dataset, split='Eval', streaming=True)
         df = pd.DataFrame(ds)
         for i in range(args.num_calib_sample):
             prompt = df["Text_Prompt"][i]
