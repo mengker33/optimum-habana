@@ -470,7 +470,6 @@ python image_to_video_generation.py \
     --video_save_dir ./wan2.2-output \
     --prompts "The cat removes the glasses from its eyes." \
     --use_habana \
-    --use_hpu_graphs \
     --height 1088 \
     --width 800 \
     --fps 24 \
@@ -511,7 +510,6 @@ python text_to_video_generation.py \
     --pipeline_type wan \
     --num_videos_per_prompt 1 \
     --use_habana \
-    --use_hpu_graphs \
     --height 704 \
     --width 1280 \
     --num_frames 121 \
