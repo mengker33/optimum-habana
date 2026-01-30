@@ -67,6 +67,12 @@ def main():
         help="Use HPU graphs to accelerate inference. Suggest not to enable it for large figure generation",
     )
     parser.add_argument(
+        "--use_compile",
+        action="store_true",
+        default=False,
+        help="Use t.compile to accelerate inference. Experimental feature.",
+    )
+    parser.add_argument(
         "--loop",
         type=int,
         default=1,
@@ -80,7 +86,7 @@ def main():
     gaudi_config = GaudiConfig(**gaudi_config_kwargs)
     kwargs = {
         "use_habana": True,
-        "use_hpu_graphs": args.use_hpu_graphs,
+        "use_hpu_graphs": False if args.use_compile else args.use_hpu_graphs,
         "gaudi_config": gaudi_config,
     }
 
@@ -104,6 +110,9 @@ def main():
         print(f'ERROR unsupported pipline type:{args.pipeline_type}')
         exit()
     pipe.to("hpu")
+
+    if args.use_compile:
+        pipe = torch.compile(pipe)
 
     for i in range(args.loop):
         t0 = time.time()
